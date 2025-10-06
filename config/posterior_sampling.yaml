@@ -6,7 +6,7 @@ model:
   checkpoint_path: "./microscopy_runs_unet/finetune/checkpoints/last-v1.ckpt"
 
 data:
-  test_dir: "./microscopy_runs_unet/sr_test"
+  test_dir: "./microscopy_runs_unet/test_data"
   image_size: [512, 512]
   num_samples: 10  # Number of images to process
   random_select: true  # Randomly select images instead of taking first n
@@ -14,7 +14,7 @@ data:
 
 output:
   save_dir: "./posterior_samples"
-  save_intermediate: false
+  save_intermediate: true
   save_comparison: true
   add_labels: false  # Add text labels to comparison images
 
@@ -23,18 +23,23 @@ daps:
   # Annealing schedule
   annealing_steps: 100  # Number of noise levels to anneal through
   sigma_max: 100.0      # Maximum noise level
-  sigma_min: 0.1     # Minimum noise level
-  
+  sigma_min: 0.1        # Minimum noise level
+
   # MCMC sampling
   mcmc_steps: 100       # Number of Langevin steps per annealing level
-  mcmc_lr: 0.001         # Learning rate for Langevin dynamics
-  mc_algo: "langevin"  # MCMC algorithm: "langevin" or "hmc"
-  
+  mcmc_lr: 0.001        # Learning rate for Langevin dynamics
+  mc_algo: "langevin"   # MCMC algorithm: "langevin" or "hmc"
+
   # Data consistency
-  tau: 0.02            # Temperature for data-fitting term
-  
+  tau: 0.02             # Temperature for data-fitting term
+
   # Prior
   prior_solver: "gaussian"  # Prior score computation method
+
+  # ODE Solver Configuration
+  # Options: "tweedie" (order 0, 1-step), "euler" (order 1), "heun" (order 2), "rk4" (order 4), "dopri5" (order 5)
+  solver: "euler"     # Default: direct denoising (fastest)
+  num_ode_steps: 4     # ODE steps for euler/heun/rk4/dopri5 (ignored for tweedie)
 
 # Forward Operator (Degradation Model)
 operator:
