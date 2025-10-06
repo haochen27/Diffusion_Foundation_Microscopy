@@ -1,0 +1,60 @@
+# Posterior Sampling Configuration
+# =================================
+# Configuration for DAPS-based posterior sampling on microscopy images
+
+model:
+  checkpoint_path: "./microscopy_runs_unet/finetune/checkpoints/last-v1.ckpt"
+
+data:
+  test_dir: "./microscopy_runs_unet/sr_test"
+  image_size: [512, 512]
+  num_samples: 10  # Number of images to process
+  random_select: true  # Randomly select images instead of taking first n
+  images_are_clean: true  # If true, apply operator to create measurements. If false, use images as measurements directly
+
+output:
+  save_dir: "./posterior_samples"
+  save_intermediate: false
+  save_comparison: true
+  add_labels: false  # Add text labels to comparison images
+
+# DAPS Algorithm Parameters
+daps:
+  # Annealing schedule
+  annealing_steps: 100  # Number of noise levels to anneal through
+  sigma_max: 100.0      # Maximum noise level
+  sigma_min: 0.1     # Minimum noise level
+  
+  # MCMC sampling
+  mcmc_steps: 100       # Number of Langevin steps per annealing level
+  mcmc_lr: 0.001         # Learning rate for Langevin dynamics
+  mc_algo: "langevin"  # MCMC algorithm: "langevin" or "hmc"
+  
+  # Data consistency
+  tau: 0.02            # Temperature for data-fitting term
+  
+  # Prior
+  prior_solver: "gaussian"  # Prior score computation method
+
+# Forward Operator (Degradation Model)
+operator:
+  type: "gaussian_blur"
+  
+  # Gaussian blur parameters
+  kernel_size: 31       # Blur kernel size (odd number)
+  intensity: 3.0        # Blur intensity (standard deviation)
+  
+  # Measurement noise
+  noise_sigma: 0.05     # Additive Gaussian noise std
+
+# Device Configuration
+device:
+  device: "cuda"        # "cuda" or "cpu"
+  gpu_id: 0             # GPU device ID
+
+# Advanced Options
+advanced:
+  seed: 42
+  verbose: true
+  show_progress: true
+
