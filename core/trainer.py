@@ -82,10 +82,15 @@ class MicroscopyTrainer:
         )
         
         # Validation data
+        # Use model.input_size for validation resize if provided
+        target_sz = tuple(self.config.get('model', {}).get('input_size') or [])
+        if not (isinstance(target_sz, (list, tuple)) and len(target_sz) == 2):
+            target_sz = None
         val_dataset = ValidationDataset(
             self.config['data']['foundation_path'],
             phase_config['datasets'],
-            max_samples=50
+            max_samples=50,
+            target_size=target_sz
         )
         val_loader = DataLoader(
             val_dataset,

@@ -3,7 +3,7 @@
 
 # Model Configuration
 model:
-  checkpoint_path: "checkpoints/last.ckpt"  # Path to trained checkpoint
+  checkpoint_path: "./microscopy_runs_unet/finetune/checkpoints/last-v1.ckpt"  # Path to trained checkpoint
   phase: "unconditional"  # "unconditional" or "conditional"
   num_train_timesteps: 1000  # Number of timesteps used during training
   
@@ -13,7 +13,7 @@ sampling:
   method: "edm_euler"
   
   # Number of sampling steps
-  num_steps: 50
+  num_steps: 200
   
   # Guidance scale for conditional sampling (1.0 = no guidance)
   guidance_scale: 7.5
@@ -23,7 +23,7 @@ sampling:
   
   # EDM-specific parameters
   edm:
-    sigma_data: 0.25
+    sigma_data: 0.5
     sigma_min: 0.002
     sigma_max: 80.0
     rho: 7.0
@@ -119,7 +119,7 @@ advanced:
   show_progress: true
   
   # Save intermediate steps (for debugging)
-  save_intermediate: false
+  save_intermediate: true
   
   # Intermediate save directory
   intermediate_dir: "intermediate_samples"

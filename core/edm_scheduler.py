@@ -154,9 +154,9 @@ class EDMEulerScheduler:
         return_dict: bool = True
     ) -> Union[torch.Tensor, Tuple]:
         """
-        Predict the sample at the previous timestep by reversing the SDE.
+        Predict the sample at the previous timestep by solving the probability flow ODE.
         
-        This is the Euler method for solving the reverse SDE.
+        This is the Euler method for solving the ODE.
         """
         
         if timestep >= len(self.sigmas):
@@ -170,16 +170,8 @@ class EDMEulerScheduler:
             sigma = sigma.unsqueeze(-1)
             sigma_prev = sigma_prev.unsqueeze(-1)
         
-        # Convert model output to denoised sample
-        if self.prediction_type == "sample":
-            # Direct sample prediction (original EDM approach)
-            denoised = model_output
-        elif self.prediction_type == "epsilon":
-            # ε-prediction: x_0 = x - σ * ε
-            denoised = sample - sigma * model_output
-        else:
-            # Fallback to sample prediction (original EDM)
-            denoised = model_output
+        # The model output from the preconditioner is the denoised sample (x0_hat)
+        denoised = model_output
         
         # Euler step: x_{t-1} = x_t + (σ_{t-1} - σ_t) * d_x
         derivative = (sample - denoised) / sigma
@@ -239,7 +231,7 @@ class EDMPreconditioner(nn.Module):
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
         c_out = sigma * self.sigma_data / torch.sqrt(sigma**2 + self.sigma_data**2)
         c_in = 1.0 / torch.sqrt(sigma**2 + self.sigma_data**2)
-        c_noise = torch.log(sigma / self.sigma_data) / 4.0
+        c_noise = sigma.log() / 4.0
         
         # Apply input scaling
         x_scaled = c_in * x
@@ -268,17 +260,14 @@ class EDMPreconditioner(nn.Module):
 
         # Apply output scaling based on prediction type
         if self.prediction_type == "sample":
-            # Direct sample prediction (original EDM approach)
-            denoised = model_output
+            # F_theta is the model output, which is the denoised sample
+            result = c_skip * x + c_out * model_output
         elif self.prediction_type == "epsilon":
-            # For epsilon prediction
-            denoised = (x - sigma * model_output)
+            # model predicts epsilon, convert to denoised sample x0_hat
+            result = x - sigma * model_output
         else:
             # Fallback to sample prediction (original EDM)
-            denoised = model_output
-        
-        # Apply skip connection and output scaling
-        result = c_skip * x + c_out * (denoised - c_skip * x)
+            result = c_skip * x + c_out * model_output
         
         return result
 

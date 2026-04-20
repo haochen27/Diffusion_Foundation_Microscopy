@@ -16,6 +16,7 @@ import sys
 import csv
 import json
 import numpy as np
+from torch.utils import tensorboard
 
 # Add repo and core module paths for absolute imports
 repo_dir = Path(__file__).parent

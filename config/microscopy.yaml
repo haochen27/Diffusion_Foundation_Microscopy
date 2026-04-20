@@ -3,15 +3,15 @@
 
 # Data configuration
 data:
-  foundation_path: "/mnt/e/Microscopy_dataset/processed/foundation"
-  degraded_path: "/mnt/e/Microscopy_dataset/processed/degraded"
+  foundation_path: "../processed/foundation"
+  degraded_path: "../processed/degraded"
 
 # Model configuration
 model:
-  architecture: "DiT-XL/8"        # DiT-XL with patch size 8 for 512x512
+  architecture: "DiT-S/8"        # DiT-L with patch size 8 for 512x512
   input_size: [512, 512]          # Direct pixel-level input size
   patch_size: 8                   # Patch size for DiT (512//8 = 64 patches per dim)
-  hidden_size: 1152               # DiT-XL hidden dimension
+  hidden_size: 384               # DiT-XL hidden dimension
   # Settings used when training in VAE latent space
   latent_size: 64                 # Spatial size of VAE latents (e.g., 64x64)
   latent_channels: 4              # Channel count of VAE latents (SD VAE uses 4)
@@ -26,11 +26,11 @@ vae:
 # Training configuration
 train:
   accumulate_grad_batches: 1            # increase for gradient accumulation if memory-bound
-  dataloader_workers: 8                 # tune per machine; A100/H100 can handle higher
+  dataloader_workers: 16                 # tune per machine; A100/H100 can handle higher
   #devices: 2                           # force specific number of GPUs (auto-detect if not set)
   save_interval: 1000
   gradient_checkpointing: false   # DiT doesn't need this
-  save_path: "microscopy_runs"
+  save_path: "microscopy_runs_rxrx1"
 
   # Logging (optional)
   wandb:
@@ -48,26 +48,26 @@ scheduler:
   num_train_timesteps: 1000
   sigma_min: 0.002
   sigma_max: 80.0
-  sigma_data: 0.25
+  sigma_data: 0.4
   rho: 7.0
   prediction_type: "sample" 
 
 # EMA (Exponential Moving Average) configuration
 ema:
   enabled: true
-  decay: 0.9999
+  decay: 0.9995
   update_every: 1
   start_step: 2000
 
 # Real-time monitoring
 monitoring:
-  log_every_n_steps: 1000
-  val_check_interval: 1000
+  log_every_n_steps: 95
+  val_check_interval: 95
   progress_bar: true
-  save_top_k: 4
+  save_top_k: 2
   monitor_metric: "val_loss"
   # Image logging
-  image_log_every_n_steps: 200
+  image_log_every_n_steps: 2000
   image_log_max_images: 8
   
   # Real-time plots
@@ -84,50 +84,49 @@ monitoring:
 ## Phase definitions (production scale)
 phases:
   # Phase 1: Unconditional prior on ~100k images
-  - name: "phase1_unconditional"
+  - name: "rxrx1"
     type: "unconditional"
-    epochs: 100                          # TEST: 1 epoch only
-    batch_size: 12                      # TEST: 1 image per batch
-    max_steps: 5000000                   # Large number - let epoch complete naturally
-    #resume_from_checkpoint: "runs/checkpoints/phase1_unconditional_best-epoch=001.ckpt"  # manual resume
-    #min_steps: 1000                     # minimum steps before early stop
-    datasets: ["sr_caco2", "fmd", "neuronal_cells", "rxrx1"]
-    epochs_to_save: [30, 60, 90, 100]
-    description: "Unconditional DiT-XL/8 prior on microscopy foundation (~100k images)"
+    epochs: 200                       # or tune based on dataset size
+    batch_size: 64                     # adjust per GPU memory
+    max_steps: -1                     # ~100k images at batch_size=16
+    resume_from_checkpoint: "./microscopy_runs/checkpoints/phase1_unconditional_epoch_050.ckpt"  # manual resume
+    #min_steps: 1000                     # minimum steps before early sto2
+    datasets: ["rxrx1"]
+    epochs_to_save: [50, 100, 150, 200]
+    description: "Unconditional DiT-S/8 prior on microscopy foundation (~100k images)"
+# #Phase 2: Noisy Training on 60–200k images
+#   - name: "phase2_noisy"
+#     type: "conditional"
+#     epochs: 120                          # or tune based on dataset size
+#     batch_size: 16
+#     #max_steps: 7500                     # ~120k images; use 3750 for ~60k, 12500 for ~200k
+#     #resume_from_checkpoint: "runs/checkpoints/phase2_conditional_best-epoch=001.ckpt"  # manual resume
+#     #min_steps: 1000                     # minimum steps before early stop
+#     datasets: ["sr_caco2", "fmd"]
+#     base_from_phase: "phase1_unconditional"
+#     condition_types: ["super_resolution", "denoising", "deblurring"]
+#     condition_dropout: 0.1
+#     epochs_to_save: [40, 80, 120]
+#     description: "Conditional DiT with manual + real degradations (60–200k images)"
 
-  # Phase 2: Conditional control on 60–200k images
-  - name: "phase2_conditional"
-    type: "conditional"
-    epochs: 120                          # or tune based on dataset size
-    batch_size: 16
-    #max_steps: 7500                     # ~120k images; use 3750 for ~60k, 12500 for ~200k
-    #resume_from_checkpoint: "runs/checkpoints/phase2_conditional_best-epoch=001.ckpt"  # manual resume
-    #min_steps: 1000                     # minimum steps before early stop
-    datasets: ["sr_caco2", "fmd"]
-    base_from_phase: "phase1_unconditional"
-    condition_types: ["super_resolution", "denoising", "deblurring"]
-    condition_dropout: 0.1
-    epochs_to_save: [40, 80, 120]
-    description: "Conditional DiT with manual + real degradations (60–200k images)"
+#     # Manual degradation augmentation
+#     use_manual_degradation: true
+#     manual_degradation_ratio: 0.6
 
-    # Manual degradation augmentation
-    use_manual_degradation: true
-    manual_degradation_ratio: 0.6
+#     # Mapping degradation modes to tasks
+#     degradation_to_task_map:
+#       blur: "deblurring"
+#       noise: "denoising"
+#       downsample: "super_resolution"
 
-    # Mapping degradation modes to tasks
-    degradation_to_task_map:
-      blur: "deblurring"
-      noise: "denoising"
-      downsample: "super_resolution"
-
-    degradation_modes: ["blur", "noise", "downsample"]
-    degradation_params:
-      blur:
-        psf_scale: [1.0, 3.0]
-        extra_sigma_px: [0.0, 2.0]
-      noise:
-        target_snr_at_full_scale: [10, 50]
-        read_noise_e: [1.0, 3.0]
-      downsample:
-        factor: [2, 6]
-        upsample_back: true
+#     degradation_modes: ["blur", "noise", "downsample"]
+#     degradation_params:
+#       blur:
+#         psf_scale: [1.0, 3.0]
+#         extra_sigma_px: [0.0, 2.0]
+#       noise:
+#         target_snr_at_full_scale: [10, 50]
+#         read_noise_e: [1.0, 3.0]
+#       downsample:
+#         factor: [2, 6]
+#         upsample_back: true

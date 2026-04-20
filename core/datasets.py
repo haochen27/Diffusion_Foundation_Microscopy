@@ -6,7 +6,10 @@ Handles loading and pairing of foundation/degraded microscopy data
 
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
-from typing import Dict, List
+import torch.nn.functional as F
+from typing import Optional, Tuple
+from typing import Union, Optional, Tuple
+from typing import Dict, List, Union
 import sys
 import random
 import numpy as np
@@ -30,6 +33,22 @@ class MicroscopyDataset(Dataset):
         self.config = config
         self.phase_config = phase_config
         self.condition_dropout = phase_config.get('condition_dropout', 0.0)
+        # Optional resize transform based on config.model.input_size
+        self._resize = None
+        try:
+            sz = tuple(self.config.get('model', {}).get('input_size') or [])
+            if isinstance(sz, (list, tuple)) and len(sz) == 2:
+                target_h, target_w = int(sz[0]), int(sz[1])
+                def _transform(sample):
+                    img = sample.get('image')
+                    if torch.is_tensor(img) and img.dim() == 3:
+                        if img.shape[-2:] != (target_h, target_w):
+                            img = F.interpolate(img.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(0)
+                            sample['image'] = img
+                    return sample
+                self._resize = _transform
+        except Exception:
+            self._resize = None
         
         # Load datasets based on phase
         if phase_config['type'] == 'unconditional':
@@ -41,7 +60,8 @@ class MicroscopyDataset(Dataset):
         """Setup Phase 1: Foundation data only"""
         self.dataset = build_manifest_dataset(
             roots=[self.config['data']['foundation_path']],
-            include_datasets=self.phase_config['datasets']
+            include_datasets=self.phase_config['datasets'],
+            transform=self._resize
         )
         self.condition_types = []
         print(f"[DATASET] Phase 1: {len(self.dataset)} foundation samples")
@@ -52,7 +72,8 @@ class MicroscopyDataset(Dataset):
         # Load foundation dataset
         self.foundation_dataset = build_manifest_dataset(
             roots=[self.config['data']['foundation_path']],
-            include_datasets=self.phase_config['datasets']
+            include_datasets=self.phase_config['datasets'],
+            transform=self._resize
         )
         
         # Check if manual degradation is enabled
@@ -84,7 +105,8 @@ class MicroscopyDataset(Dataset):
         
         self.degraded_dataset = build_manifest_dataset(
             roots=[self.config['data']['degraded_path']],
-            include_datasets=degraded_datasets
+            include_datasets=degraded_datasets,
+            transform=self._resize
         )
         
         # Setup weighted sampling for mixed real + manually degraded data
@@ -377,10 +399,22 @@ class MicroscopyDataset(Dataset):
 class ValidationDataset(Dataset):
     """Validation dataset for evaluation"""
     
-    def __init__(self, foundation_path: str, datasets: List[str], max_samples: int = 100):
+    def __init__(self, foundation_path: str, datasets: List[str], max_samples: int = 100, target_size: Optional[Tuple[int, int]] = None):
+        # Optional resize transform
+        transform = None
+        if target_size and len(target_size) == 2:
+            th, tw = int(target_size[0]), int(target_size[1])
+            def _t(sample):
+                img = sample.get('image')
+                if torch.is_tensor(img) and img.dim() == 3 and img.shape[-2:] != (th, tw):
+                    img = F.interpolate(img.unsqueeze(0), size=(th, tw), mode='bilinear', align_corners=False).squeeze(0)
+                    sample['image'] = img
+                return sample
+            transform = _t
         self.dataset = build_manifest_dataset(
             roots=[foundation_path],
-            include_datasets=datasets
+            include_datasets=datasets,
+            transform=transform
         )
         
         # Limit validation size

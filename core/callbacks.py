@@ -383,10 +383,15 @@ class SampleGenerationCallback(Callback):
             pl_module.eval()
             from .sampling import MicroscopySampler
             with torch.no_grad():
+                # Use model.input_size if available
+                try:
+                    cfg_img_h, cfg_img_w = pl_module.config.get('model', {}).get('input_size', [512, 512])
+                except Exception:
+                    cfg_img_h, cfg_img_w = 512, 512
                 sampler = MicroscopySampler._create_from_module(pl_module, {
                     'output': {
                         'num_samples': self.num_samples,
-                        'image_size': [512, 512],
+                        'image_size': [int(cfg_img_h), int(cfg_img_w)],
                         'save_individual': False,
                         'save_grid': True,
                         'image_format': 'png',

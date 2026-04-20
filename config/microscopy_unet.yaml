@@ -41,13 +41,13 @@ scheduler:
   num_train_timesteps: 1000
   sigma_min: 0.002
   sigma_max: 80.0
-  sigma_data: 0.4
+  sigma_data: 0.5
   rho: 7.0
   prediction_type: "sample"
 
 ema:
   enabled: true
-  decay: 0.9999
+  decay: 0.9995
   update_every: 1
   start_step: 2000
 

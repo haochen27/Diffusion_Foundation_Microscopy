@@ -100,6 +100,11 @@ class MicroscopyDiTModel(L.LightningModule):
                 sigma_data=scheduler_config.get('sigma_data', 0.4),
                 prediction_type=scheduler_config.get('prediction_type', 'sample')
             )
+
+            # EDM log-normal training hyperparameters (Karras et al. 2022, Table 1)
+            self.P_mean = float(scheduler_config.get('P_mean', -1.2))
+            self.P_std = float(scheduler_config.get('P_std', 1.2))
+            self.sigma_data = float(scheduler_config.get('sigma_data', 0.4))
             
         else:
             print("[DIFFUSION] Using default diffusion")
@@ -226,29 +231,22 @@ class MicroscopyDiTModel(L.LightningModule):
         return x
     
     def _compute_edm_loss(self, latents, condition_emb=None):
-        """Compute loss using EDM scheduler"""
+        """Compute loss using EDM log-normal σ sampling (Karras et al. 2022)"""
         
         batch_size = latents.shape[0]
         device = latents.device
-        # Debug controls
-        debug_cfg = self.config.get('monitoring', {}) if hasattr(self, 'config') else {}
-        debug_every = int(debug_cfg.get('debug_every_n_steps', 50))
-        enable_debug = bool(debug_cfg.get('debug_edm', True))
-        global_step = int(getattr(self, 'global_step', 0))
-        should_debug = enable_debug and (global_step % max(1, debug_every) == 0)
-        
-        # Sample random timesteps
-        timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (batch_size,), device=device)
-        
-        # Sample noise
+
+        # EDM log-normal σ sampling (Karras et al. 2022, Eq. 5 / Table 1)
+        rnd_normal = torch.randn([batch_size, 1, 1, 1], device=device)
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp()  # log σ ~ N(P_mean, P_std²)
+
+        # Forward process: x_t = x_0 + σ · ε
         noise = torch.randn_like(latents)
-        
-        # Add noise to latents
-        noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
-        
-        # Obtain per-sample sigma values
-        sigma_vals = self.scheduler.sigmas[timesteps.detach().to('cpu')].to(latents.device)
-        
+        noisy_latents = latents + noise * sigma
+
+        # Obtain per-sample sigma values for the preconditioner
+        sigma_vals = sigma.reshape(batch_size).to(device)
+
         # Forward pass via EDM preconditioner (expects unscaled x_t)
         # This yields the denoised estimate x0_hat aligned with sampling logic
         if hasattr(self, 'edm_preconditioner'):
@@ -256,13 +254,13 @@ class MicroscopyDiTModel(L.LightningModule):
         else:
             # Fallback (should not happen when EDM is enabled)
             y = torch.zeros(noisy_latents.shape[0], dtype=torch.long, device=noisy_latents.device)
-            t_cont = torch.log(sigma_vals / self.scheduler.sigma_data) / 4.0
+            t_cont = sigma_vals.log() / 4.0
             model_output = self.model(noisy_latents, t_cont, y)
-        
+
         # Compute target
         scheduler_config = self.config.get('scheduler', {})
         prediction_type = scheduler_config.get('prediction_type', 'sample')
-        
+
         if prediction_type == "sample":
             # Compare denoised estimate x0_hat against clean latents x0
             target = latents
@@ -271,24 +269,19 @@ class MicroscopyDiTModel(L.LightningModule):
         else:
             # Default to sample prediction (original EDM)
             target = latents
-        
-        # Compute loss with EDM weighting
-        loss_weights = self.scheduler.get_loss_weights(timesteps)
+
         # Ensure shapes match for MSE (model_output and target must have same channels)
         if model_output.shape != target.shape:
             # If model predicts 2*C (mean, var) and target is C, use the mean part only
             if model_output.shape[1] == target.shape[1] * 2:
                 model_output = model_output[:, :target.shape[1], ...]
-        loss = torch.nn.functional.mse_loss(model_output, target, reduction='none')
-        
-        # Apply loss weights
-        while len(loss_weights.shape) < len(loss.shape):
-            loss_weights = loss_weights.unsqueeze(-1)
-        
-        weighted_loss = loss * loss_weights
-        # Debug disabled
-        
-        return weighted_loss.mean()
+
+        # EDM loss weighting: λ(σ) = (σ² + σ_data²) / (σ · σ_data)²
+        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+
+        loss = weight * (model_output - target) ** 2
+
+        return loss.mean()
     
     def training_step(self, batch, batch_idx):
         """Training step"""

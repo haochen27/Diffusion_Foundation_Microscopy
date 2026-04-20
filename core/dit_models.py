@@ -234,7 +234,7 @@ class DiT(nn.Module):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
+        t: (N,) EDM continuous time; t = log(sigma) / 4
         y: (N,) tensor of class labels
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
@@ -247,23 +247,22 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, uncond_y):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        Classifier-free guidance forward.
+        NOTE: `t` is the EDM continuous time (t = log(sigma) / 4), not a discrete step.
+        `uncond_y` should be the unconditional labels (e.g., a reserved null id per sample).
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        # Batch cond & uncond in one pass
+        x_cat = torch.cat([x, x], dim=0)
+        t_cat = torch.cat([t, t], dim=0)
+        y_cat = torch.cat([y, uncond_y], dim=0)
+
+        out = self.forward(x_cat, t_cat, y_cat)   # (2B, C, H, W)
+        cond, uncond = out.chunk(2, dim=0)
+        # Apply CFG on all channels (works for grayscale C=1)
+        guided = uncond + cfg_scale * (cond - uncond)
+        return guided
 
 
 #################################################################################

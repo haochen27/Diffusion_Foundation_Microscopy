@@ -27,6 +27,14 @@ class Operator:
         y0 = self(x)
         return y0 + self.sigma * torch.randn_like(y0)
 
+    def measure_poisson(self, x, scale=100.0):
+        """Measure input by applying operator and adding Poisson noise"""
+        self.poisson_scale = scale
+        y0 = self(x)
+        rate = torch.clamp((y0+1) / 2 * 1, min=0)
+        noisy_counts = torch.poisson(rate*scale)
+        return (noisy_counts/scale*2-1).clamp(-1, 1)
+
     def loss(self, x, y):
         """Compute squared-error loss"""
         return ((self(x) - y) ** 2).flatten(1).sum(-1)

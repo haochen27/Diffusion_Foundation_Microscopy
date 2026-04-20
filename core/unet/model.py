@@ -43,6 +43,11 @@ class MicroscopyUnetModel(L.LightningModule):
         )
         self.use_edm = True
 
+        # EDM log-normal training hyperparameters (Karras et al. 2022, Table 1)
+        self.P_mean = float(self.config.get('scheduler', {}).get('P_mean', -1.2))
+        self.P_std = float(self.config.get('scheduler', {}).get('P_std', 1.2))
+        self.sigma_data = float(self.config.get('scheduler', {}).get('sigma_data', 0.4))
+
         # VAE (optional, reuse logic from DiT model if needed later)
         self.vae = None
         if self.config.get('vae', {}).get('enabled', False):
@@ -68,17 +73,24 @@ class MicroscopyUnetModel(L.LightningModule):
     def _compute_edm_loss(self, latents: torch.Tensor, condition_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         b = latents.shape[0]
         device = latents.device
-        timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (b,), device=device)
+
+        # EDM log-normal σ sampling (Karras et al. 2022, Eq. 5 / Table 1)
+        rnd_normal = torch.randn([b, 1, 1, 1], device=device)
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp()  # log σ ~ N(P_mean, P_std²)
+
+        # Forward process: x_t = x_0 + σ · ε
         noise = torch.randn_like(latents)
-        x_t = self.scheduler.add_noise(latents, noise, timesteps)
-        sigma_vals = self.scheduler.sigmas[timesteps.detach().to('cpu')].to(device)
+        x_t = latents + noise * sigma
+
+        # Denoised estimate via EDM preconditioner
+        sigma_vals = sigma.reshape(b).to(device)
         x0_hat = self.edm_preconditioner(x_t, sigma_vals)
-        target = latents
-        weights = self.scheduler.get_loss_weights(timesteps)
-        loss = torch.nn.functional.mse_loss(x0_hat, target, reduction='none')
-        while len(weights.shape) < len(loss.shape):
-            weights = weights.unsqueeze(-1)
-        return (loss * weights).mean()
+
+        # EDM loss weighting: λ(σ) = (σ² + σ_data²) / (σ · σ_data)²
+        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+
+        loss = weight * (x0_hat - latents) ** 2
+        return loss.mean()
 
     def training_step(self, batch, batch_idx):
         images = batch['image']

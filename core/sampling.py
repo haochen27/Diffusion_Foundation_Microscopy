@@ -256,10 +256,51 @@ class MicroscopySampler:
         
         return samples
     
+    def _denoise(self, x, sigma_vec, shape, condition_hints, use_cuda, amp_dtype, y_label):
+        """Compute denoised estimate x0_hat at given sigma. Shared by Euler & Heun."""
+        bsz = shape[0]
+        if hasattr(self, 'edm_preconditioner') and self.edm_preconditioner is not None:
+            if use_cuda:
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                    return self.edm_preconditioner(x, sigma_vec)
+            else:
+                return self.edm_preconditioner(x, sigma_vec)
+        else:
+            sigma_data = self.scheduler.sigma_data
+            sigma_i = sigma_vec[0]  # scalar
+            c_in = 1.0 / torch.sqrt(sigma_data**2 + sigma_i**2)
+            c_noise_val = sigma_i.log() / 4.0
+            x_in = c_in.view(-1, 1, 1, 1) * x
+            t_vec = c_noise_val.expand(bsz)
+
+            if condition_hints is not None and hasattr(self, 'condition_encoder'):
+                condition_emb = self._encode_conditions(condition_hints)
+                if use_cuda:
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                        model_output = self.model.forward(x_in, t_vec, condition_emb)
+                else:
+                    model_output = self.model.forward(x_in, t_vec, condition_emb)
+            else:
+                if use_cuda:
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                        model_output = self.model.model(x_in, t_vec, y_label)
+                else:
+                    model_output = self.model.model(x_in, t_vec, y_label)
+
+            in_channels = x.shape[1]
+            if model_output.shape[1] != in_channels:
+                model_output = model_output[:, :in_channels, ...]
+            model_output = model_output.to(dtype=x.dtype)
+
+            c_skip = sigma_data**2 / (sigma_i**2 + sigma_data**2)
+            c_out = sigma_i * sigma_data / torch.sqrt(sigma_i**2 + sigma_data**2)
+            return c_skip.view(-1,1,1,1) * x + c_out.view(-1,1,1,1) * model_output
+
     def _generate_edm_samples(self, shape: Tuple[int, ...], condition_hints: Optional[Dict] = None) -> torch.Tensor:
-        """Generate samples using EDM Euler sampling aligned with training."""
+        """Generate samples using EDM Heun sampling (Algorithm 2, Karras et al. 2022)."""
         sampling_config = self.config['sampling']
         num_steps = int(sampling_config['num_steps'])
+        use_heun = sampling_config.get('solver', 'heun') == 'heun'
 
         # Setup intermediate saving
         save_intermediate = self.config['advanced'].get('save_intermediate', False)
@@ -270,19 +311,14 @@ class MicroscopySampler:
 
         # Get sigma schedule (decreasing from sigma_max -> sigma_min)
         sigmas = self.scheduler.sigmas.to(self.device)
-        sigma_data = self.scheduler.sigma_data
 
         # Optionally sub-sample to num_steps
         if num_steps is not None and num_steps < len(sigmas):
-            # Choose indices monotonically from 0..len-1
             idxs = torch.linspace(0, len(sigmas)-1, steps=num_steps).round().long()
             sigmas = sigmas[idxs]
 
-        # EDM constants as functions of sigma
-        def c_skip(s): return (sigma_data**2) / (s**2 + sigma_data**2)
-        def c_out(s):  return s * sigma_data / torch.sqrt(s**2 + sigma_data**2)
-        def c_in(s):   return 1.0 / torch.sqrt(s**2 + sigma_data**2)
-        def c_noise(s): return torch.log(s / sigma_data) / 4.0
+        # Append t_N = 0 (EDM convention: generate.py line 33)
+        sigmas = torch.cat([sigmas, torch.zeros_like(sigmas[:1])])
 
         # Initialize x ~ N(0, sigma_max^2 I)
         x = torch.randn(shape, device=self.device) * sigmas[0]
@@ -290,79 +326,44 @@ class MicroscopySampler:
         if save_intermediate:
             self._save_intermediate_step(x, intermediate_dir, 0, "noise")
 
+        num_solver_steps = len(sigmas) - 1
         if self.config['advanced'].get('show_progress', True):
-            step_iter = tqdm(range(len(sigmas) - 1), desc="EDM Sampling")
+            step_iter = tqdm(range(num_solver_steps), desc=f"EDM {'Heun' if use_heun else 'Euler'}")
         else:
-            step_iter = range(len(sigmas) - 1)
+            step_iter = range(num_solver_steps)
 
         # Mixed precision toggle for memory headroom
         use_cuda = torch.cuda.is_available() and self.device.type == 'cuda'
         use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
         amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
         y_label = torch.zeros(shape[0], dtype=torch.long, device=self.device)
+        bsz = shape[0]
 
         with torch.no_grad():
             for i in step_iter:
                 sigma_i = sigmas[i]
                 sigma_ip1 = sigmas[i+1]
 
-                # Prepare per-sample sigma tensors
-                bsz = shape[0]
-                s_vec = sigma_i.expand(bsz) if sigma_i.ndim == 0 else sigma_i
+                # Denoised estimate at current sigma
+                x0_hat = self._denoise(x, sigma_i.expand(bsz), shape, condition_hints,
+                                       use_cuda, amp_dtype, y_label)
 
-                # Network input preconditioning
-                x_in = c_in(sigma_i).view(-1, 1, 1, 1) * x
-                t_vec = c_noise(sigma_i).expand(bsz)
+                # Euler step: d = (x - x0_hat) / sigma
+                d_cur = (x - x0_hat) / sigma_i.view(-1,1,1,1)
+                x_next = x + (sigma_ip1 - sigma_i).view(-1,1,1,1) * d_cur
 
-                # Model forward using EDM preconditioner (must match training call!)
-                if hasattr(self, 'edm_preconditioner') and self.edm_preconditioner is not None:
-                    # Use EDM preconditioner exactly like training
-                    if use_cuda:
-                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                            x0_hat = self.edm_preconditioner(x, sigma_i.expand(bsz))
-                    else:
-                        x0_hat = self.edm_preconditioner(x, sigma_i.expand(bsz))
-                else:
-                    # Fallback: manual EDM preconditioning
-                    if condition_hints is not None and hasattr(self, 'condition_encoder'):
-                        # Conditional sampling using model.forward with condition embedding
-                        condition_emb = self._encode_conditions(condition_hints)
-                        if use_cuda:
-                            with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                                model_output = self.model.forward(x_in, t_vec, condition_emb)
-                        else:
-                            model_output = self.model.forward(x_in, t_vec, condition_emb)
-                    else:
-                        if use_cuda:
-                            with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                                model_output = self.model.model(x_in, t_vec, y_label)
-                        else:
-                            model_output = self.model.model(x_in, t_vec, y_label)
+                # Heun's 2nd order correction (EDM Algorithm 2)
+                if use_heun and i < num_solver_steps - 1 and sigma_ip1 > 0:
+                    x0_hat_next = self._denoise(x_next, sigma_ip1.expand(bsz), shape,
+                                                condition_hints, use_cuda, amp_dtype, y_label)
+                    d_prime = (x_next - x0_hat_next) / sigma_ip1.view(-1,1,1,1)
+                    x_next = x + (sigma_ip1 - sigma_i).view(-1,1,1,1) * (0.5 * d_cur + 0.5 * d_prime)
 
-                    # Ensure channel compatibility: some models output 2*C (mean,var). Keep first C.
-                    in_channels = x.shape[1]
-                    if model_output.shape[1] != in_channels:
-                        model_output = model_output[:, :in_channels, ...]
-
-                    # Match dtype to running sample tensor to avoid upcasting memory
-                    model_output = model_output.to(dtype=x.dtype)
-
-                    # EDM boundary condition / denoised estimate x0_hat
-                    x0_hat = c_skip(sigma_i).view(-1,1,1,1) * x + c_out(sigma_i).view(-1,1,1,1) * model_output
-
-                if i == len(sigmas) - 2:
-                    # Last step: take x0 directly
-                    x = x0_hat
-                else:
-                    # Euler step along sigma
-                    # dx/dsigma = (x - x0_hat)/sigma
-                    d = (x - x0_hat) / sigma_i.view(-1,1,1,1)
-                    x = x + (sigma_ip1 - sigma_i).view(-1,1,1,1) * d
+                x = x_next
 
                 # Save intermediate steps
                 if save_intermediate and intermediate_dir is not None:
-                    # Save every 10 steps or at key points
-                    if (i + 1) % 10 == 0 or (i + 1) == len(sigmas) - 1:
+                    if (i + 1) % 10 == 0 or (i + 1) == num_solver_steps:
                         step_name = f"step_{i+1:03d}_sigma_{sigma_ip1.item():.3f}"
                         self._save_intermediate_step(x, intermediate_dir, i + 1, step_name)
 

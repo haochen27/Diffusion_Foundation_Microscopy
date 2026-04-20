@@ -5,6 +5,7 @@ DAPS-based posterior sampling using trained UNet model with Gaussian blur degrad
 """
 
 import json
+import csv
 import yaml
 import torch
 import numpy as np
@@ -19,6 +20,7 @@ from utils.operators import GaussianBlur
 from utils.mcmc_sampler import MCMCSampler
 from utils.scheduler import DAPS
 from utils.model_wrapper import MicroscopyDiffusionModel
+from utils.metrics import compute_metrics
 
 
 # ============================================================================
@@ -79,68 +81,43 @@ def load_image(image_path, size=(512, 512)):
 
 def save_results(images_dict, output_path, add_labels=False):
     """
-    Save side-by-side comparison: measurement | reconstructed
-    
-    Normalization flow:
-    - Input: tensors in [-1, 1] range (model output)
-    - Convert: [-1, 1] -> [0, 1] for display
-    - Save: torchvision.save_image handles [0, 1] -> [0, 255] conversion
-    
-    Args:
-        images_dict: Dictionary with 'measurement' and 'reconstructed' keys (in [-1, 1])
-        output_path: Path to save the image
-        add_labels: Whether to add text labels
+    Save side-by-side comparison of all provided images.
+    All inputs expected in [-1, 1] range.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Convert from [-1, 1] to [0, 1] for saving
-    measurement = images_dict.get('measurement')
-    reconstructed = images_dict.get('reconstructed')
-    
-    if measurement is not None:
-        # [-1, 1] -> [0, 1], then clip to ensure valid range
-        measurement = (measurement * 0.5 + 0.5).clamp(0, 1)
-    
-    if reconstructed is not None:
-        # [-1, 1] -> [0, 1], then clip to ensure valid range
-        reconstructed = (reconstructed * 0.5 + 0.5).clamp(0, 1)
-    
-    # Create side-by-side comparison
-    if measurement is not None and reconstructed is not None:
-        # Stack horizontally: [measurement | reconstructed]
-        side_by_side = torch.cat([measurement, reconstructed], dim=2)  # Concatenate along width
-        # save_image converts [0, 1] -> [0, 255] automatically
-        save_image(side_by_side, str(output_path))
-        print(f"[SAVE] Saved to: {output_path}")
-        
-        # Optionally add labels using PIL
-        if add_labels:
-            try:
-                from PIL import Image, ImageDraw, ImageFont
-                img = Image.open(output_path)
-                draw = ImageDraw.Draw(img)
-                
-                # Try to use a larger font, fallback to default
-                try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-                except:
-                    font = ImageFont.load_default()
-                
-                # Add labels
-                width = img.width
-                draw.text((10, 10), "Input/Measurement", fill='white', font=font)
-                draw.text((width // 2 + 10, 10), "Reconstructed", fill='white', font=font)
-                
-                img.save(output_path)
-            except Exception as e:
-                print(f"[WARNING] Could not add labels: {e}")
-                
-    elif reconstructed is not None:
-        save_image(reconstructed, str(output_path))
-        print(f"[SAVE] Saved to: {output_path}")
-    else:
+
+    # Convert all images to [0, 1] and collect in order
+    panels = []
+    labels = []
+    for name, img in images_dict.items():
+        if img is not None:
+            panels.append((img * 0.5 + 0.5).clamp(0, 1))
+            labels.append(name)
+
+    if len(panels) == 0:
         print(f"[WARNING] No images to save")
+        return
+
+    side_by_side = torch.cat(panels, dim=2)  # concat along width
+    save_image(side_by_side, str(output_path))
+    print(f"[SAVE] Saved to: {output_path}")
+
+    if add_labels:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.open(output_path)
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+            except:
+                font = ImageFont.load_default()
+            panel_width = img.width // len(panels)
+            for i, label in enumerate(labels):
+                draw.text((i * panel_width + 10, 10), label, fill='white', font=font)
+            img.save(output_path)
+        except Exception as e:
+            print(f"[WARNING] Could not add labels: {e}")
 
 
 def save_trajectory(trajectory, output_dir, image_idx, image_name):
@@ -247,11 +224,13 @@ def main():
     annealing_steps = daps_config['annealing_steps']
     sigma_max = daps_config['sigma_max']
     sigma_min = daps_config['sigma_min']
+    rho = daps_config.get('rho', -7.0)  # Schedule curvature parameter
     mcmc_steps = daps_config['mcmc_steps']
     mcmc_lr = daps_config['mcmc_lr']
     tau = daps_config['tau']
-    solver = daps_config.get('solver', 'tweedie')  # NEW: ODE solver type
-    num_ode_steps = daps_config.get('num_ode_steps', 50)  # NEW: ODE integration steps
+    solver = daps_config.get('solver', 'tweedie')  # ODE solver type (legacy, may be unused)
+    num_ode_steps = daps_config.get('num_ode_steps', 1)  # ODE integration steps
+    sigma_bar = daps_config.get('sigma_bar', 0.5)  # Threshold for RK4 vs Tweedie switching
     
     # Operator parameters
     operator_config = config['operator']
@@ -278,7 +257,8 @@ def main():
     print(f"  MCMC steps: {mcmc_steps}")
     print(f"  Tau: {tau}")
     print(f"  Sigma range: [{sigma_min}, {sigma_max}]")
-    print(f"  ODE Solver: {solver}" + (f" ({num_ode_steps} steps)" if solver != 'tweedie' else " (direct denoising)"))
+    print(f"  Rho: {rho} (schedule curvature parameter)")
+    print(f"  Sigma bar: {sigma_bar} (RK4 when sigma < {sigma_bar}, Tweedie when sigma >= {sigma_bar})")
     
     # Load model
     model = MicroscopyDiffusionModel(checkpoint, device=device)
@@ -301,7 +281,9 @@ def main():
         sigma_max=sigma_max,
         sigma_min=sigma_min,
         solver=solver,
-        num_ode_steps=num_ode_steps
+        num_ode_steps=num_ode_steps,
+        sigma_bar=sigma_bar,
+        rho=rho
     )
     
     # Get test images
@@ -334,6 +316,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Process each image
+    all_metrics = []
     for idx, image_path in enumerate(image_files):
         print(f"\n[{idx+1}/{len(image_files)}] Processing: {image_path.name}")
         
@@ -363,24 +346,61 @@ def main():
                 reconstructed, trajectory = sampler.sample(
                     model, x_start, operator, measurement, verbose=verbose, save_trajectory=True
                 )
-                # Save trajectory
-                save_trajectory(trajectory, output_dir, idx, image_path.stem)
+                
+                # Save intermediate trajectory steps
+                traj_dir = output_dir / 'intermediate' / f'{idx:04d}_{image_path.stem}'
+                traj_dir.mkdir(parents=True, exist_ok=True)
+                save_steps = list(range(0, len(trajectory), max(1, len(trajectory) // 10)))
+                if len(trajectory) - 1 not in save_steps:
+                    save_steps.append(len(trajectory) - 1)
+                for i in save_steps:
+                    step_data = trajectory[i]
+                    step_num = step_data['step']
+                    sigma_val = step_data['sigma']
+                    x0hat_img = (step_data['x0hat'] * 0.5 + 0.5).clamp(0, 1)
+                    x0y_img = (step_data['x0y'] * 0.5 + 0.5).clamp(0, 1)
+                    save_image(x0hat_img, str(traj_dir / f'step_{step_num:04d}_sigma_{sigma_val:.4f}_x0hat.png'))
+                    save_image(x0y_img, str(traj_dir / f'step_{step_num:04d}_sigma_{sigma_val:.4f}_x0y.png'))
+                print(f"[SAVE] Saved {len(save_steps)} intermediate steps to: {traj_dir}")
             else:
                 reconstructed = sampler.sample(
                     model, x_start, operator, measurement, verbose=verbose, save_trajectory=False
                 )
         
-        # Save final results: input (degraded) | reconstructed (clean)
-        # Both are in [-1, 1], save_results will convert to [0, 1] -> [0, 255]
+        # Save final results: measurement | reconstructed | GT
         output_path = output_dir / f'result_{idx:04d}_{image_path.stem}.png'
-        save_results({
-            'measurement': input_for_display[0],  # Degraded input in [-1, 1]
-            'reconstructed': reconstructed[0]      # Reconstructed output in [-1, 1]
-        }, output_path, add_labels=add_labels)
+        result_dict = {
+            'measurement': input_for_display[0],
+            'reconstructed': reconstructed[0]
+        }
+        if images_are_clean:
+            result_dict['GT'] = loaded_image[0]
+        save_results(result_dict, output_path, add_labels=add_labels)
+
+        # Compute metrics if GT available
+        if images_are_clean:
+            recon_m = compute_metrics(reconstructed[0].cpu(), loaded_image[0].cpu())
+            input_m = compute_metrics(input_for_display[0].cpu(), loaded_image[0].cpu())
+            all_metrics.append({'image': image_path.name,
+                                'recon_psnr': recon_m['psnr'], 'recon_ssim': recon_m['ssim'],
+                                'input_psnr': input_m['psnr'], 'input_ssim': input_m['ssim']})
+            print(f"  Input   PSNR: {input_m['psnr']:.2f} dB | SSIM: {input_m['ssim']:.4f}")
+            print(f"  Recon   PSNR: {recon_m['psnr']:.2f} dB | SSIM: {recon_m['ssim']:.4f}")
     
-    print("\n" + "=" * 80)
-    print(f"[COMPLETE] All samples saved to: {output_dir}")
-    print("=" * 80)
+    # Save metrics summary
+    if all_metrics:
+        avg = {k: np.mean([m[k] for m in all_metrics]) for k in ['recon_psnr', 'recon_ssim', 'input_psnr', 'input_ssim']}
+        summary = {'method': 'Diffusion_MCMC', 'per_image': all_metrics, 'average': avg}
+        metrics_path = output_dir / 'metrics_summary.json'
+        with open(metrics_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n{'='*60}")
+        print(f"  Input   Avg PSNR: {avg['input_psnr']:.2f} dB | SSIM: {avg['input_ssim']:.4f}")
+        print(f"  Recon   Avg PSNR: {avg['recon_psnr']:.2f} dB | SSIM: {avg['recon_ssim']:.4f}")
+        print(f"  Metrics saved to: {metrics_path}")
+        print(f"{'='*60}")
+    
+    print(f"\n[COMPLETE] All samples saved to: {output_dir}")
 
 
 if __name__ == '__main__':
