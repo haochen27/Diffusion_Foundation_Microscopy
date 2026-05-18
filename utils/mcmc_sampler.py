@@ -23,22 +23,11 @@ class MCMCSampler:
         self.momentum = momentum
 
     def score_fn(self, x, x0hat, model, xt, operator, measurement, sigma):
-        """Compute conditional score function"""
-        # Data fitting term
+        """Compute conditional score function (data-fitting term only)."""
         data_fitting_grad, data_fitting_loss = operator.gradient(x, measurement, return_loss=True)
         data_term = -data_fitting_grad / self.tau ** 2
 
-        # Connection to noisy observation
-        xt_term = (xt - x) / sigma ** 2
-
-        # Prior term
-        prior_term = self.get_prior_score(x, x0hat, xt, model, sigma)
-
-        # Combine terms with gradient clipping for stability
-        total_score = data_term + xt_term + prior_term
-
-        # Clip gradients to prevent NaN
-        total_score = torch.clamp(total_score, -100.0, 100.0)
+        total_score = torch.clamp(data_term, -100.0, 100.0)
 
         return total_score, data_fitting_loss
 
