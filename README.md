@@ -2,9 +2,16 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-blue)](https://huggingface.co/)
 
-# Microscopy Diffusion Prior
+# Microscopy Diffusion Prior and Diffusion-based Sampling
 
 Unconditional diffusion prior for microscopy images, plus a DAPS-based posterior-sampling pipeline (Gaussian and Poisson/Richardson–Lucy) for inverse problems such as deblurring and denoising.
+
+## Checkpoints
+
+Pretrained UNet foundation checkpoint:
+[Download (Google Drive)](https://drive.google.com/file/d/1Ux3-oHpUS5s-h9q5gFtQpcC0e6cl2CvP/view?usp=sharing)
+
+Place the checkpoint under `microscopy_runs_unet_foundation/checkpoints/last.ckpt` (or update `model.checkpoint_path` in the relevant config).
 
 ## Features
 
