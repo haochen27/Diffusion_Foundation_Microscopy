@@ -102,7 +102,7 @@ class MCMCSampler:
 
         return x.detach()
 
-    def sample_RL(self, xt, model, x0hat, operator, measurement, sigma, ratio, verbose=False, prev_state=None):
+    def sample_RL(self, xt, model, x0hat, operator, measurement, sigma, ratio, verbose=False, prev_state=None, rl_steps=1):
         """
         Richardson-Lucy deconvolution step for data consistency.
         Switches to Gaussian MCMC at low sigma.
@@ -128,43 +128,43 @@ class MCMCSampler:
         # Initialize x in positive domain
         x = torch.clamp((x0hat + 1.0) * 0.5, min=eps) * 255.0
 
-        # One RL multiplicative update
-        x_normalized = (x / 255.0).clamp(0, 1) * 2.0 - 1.0
         with torch.no_grad():
-            Kx = operator(x_normalized)
-            Kx = torch.clamp((Kx + 1.0) * 0.5, min=eps) * 255.0
-            
-            ratio_img = y / Kx
-            
-            # Back-project ratio
-            # Since operator (Gaussian blur) is symmetric, K^T = K
-            target = ratio_img * 2.0 - 1.0
-            smoothed_target = operator(target)
-            mult_factor = (smoothed_target + 1.0) * 0.5
-            
-            # Use clamping to prevent extreme divergence
-            mult_factor_clamped = torch.clamp(mult_factor, min=0.1, max=10.0)
-            
-            # TV gradient (mimicking DiffRL compute_tv_gradient logic directly without extra fn)
-            # Simplistic 1-step TV gradient
-            diff_x = torch.zeros_like(x_normalized)
-            diff_y = torch.zeros_like(x_normalized)
-            diff_x[:, :, :, :-1] = x_normalized[:, :, :, 1:] - x_normalized[:, :, :, :-1]
-            diff_y[:, :, :-1, :] = x_normalized[:, :, 1:, :] - x_normalized[:, :, :-1, :]
-            
-            norm_x = torch.sqrt(diff_x[:, :, :, :-1]**2 + diff_y[:, :, :, :-1]**2 + eps)
-            norm_y = torch.sqrt(diff_x[:, :, :-1, :]**2 + diff_y[:, :, :-1, :]**2 + eps)
-            
-            tv_grad = torch.zeros_like(x_normalized)
-            tv_grad[:, :, :, 1:] += diff_x[:, :, :, :-1] / norm_x
-            tv_grad[:, :, 1:, :] += diff_y[:, :, :-1, :] / norm_y
-            tv_grad[:, :, :, :-1] -= diff_x[:, :, :, :-1] / norm_x
-            tv_grad[:, :, :-1, :] -= diff_y[:, :, :-1, :] / norm_y
-            
-            # Apply multiplicative update with TV regularization
-            x_new = x * (mult_factor_clamped ** alpha) / (1.0 - lam_reg * tv_grad).clamp(min=0.1)
-            
-            x0y = (x_new / 255.0).clamp(0, 1) * 2.0 - 1.0
+            for _ in range(rl_steps):
+                x_normalized = (x / 255.0).clamp(0, 1) * 2.0 - 1.0
+                Kx = operator(x_normalized)
+                Kx = torch.clamp((Kx + 1.0) * 0.5, min=eps) * 255.0
+                
+                ratio_img = y / Kx
+                
+                # Back-project ratio
+                # Since operator (Gaussian blur) is symmetric, K^T = K
+                target = ratio_img * 2.0 - 1.0
+                smoothed_target = operator(target)
+                mult_factor = (smoothed_target + 1.0) * 0.5
+                
+                # Use clamping to prevent extreme divergence
+                mult_factor_clamped = torch.clamp(mult_factor, min=0.1, max=10.0)
+                
+                # TV gradient (mimicking DiffRL compute_tv_gradient logic directly without extra fn)
+                # Simplistic 1-step TV gradient
+                diff_x = torch.zeros_like(x_normalized)
+                diff_y = torch.zeros_like(x_normalized)
+                diff_x[:, :, :, :-1] = x_normalized[:, :, :, 1:] - x_normalized[:, :, :, :-1]
+                diff_y[:, :, :-1, :] = x_normalized[:, :, 1:, :] - x_normalized[:, :, :-1, :]
+                
+                norm_x = torch.sqrt(diff_x[:, :, :, :-1]**2 + diff_y[:, :, :, :-1]**2 + eps)
+                norm_y = torch.sqrt(diff_x[:, :, :-1, :]**2 + diff_y[:, :, :-1, :]**2 + eps)
+                
+                tv_grad = torch.zeros_like(x_normalized)
+                tv_grad[:, :, :, 1:] += diff_x[:, :, :, :-1] / norm_x
+                tv_grad[:, :, 1:, :] += diff_y[:, :, :-1, :] / norm_y
+                tv_grad[:, :, :, :-1] -= diff_x[:, :, :, :-1] / norm_x
+                tv_grad[:, :, :-1, :] -= diff_y[:, :, :-1, :] / norm_y
+                
+                # Apply multiplicative update with TV regularization (Dey-Sutour: 1 + λ ∇TV)
+                x = x * (mult_factor_clamped ** alpha) / (1.0 + lam_reg * tv_grad).clamp(min=0.1)
+                
+            x0y = (x / 255.0).clamp(0, 1) * 2.0 - 1.0
             
             if verbose:
                 self.diag = {

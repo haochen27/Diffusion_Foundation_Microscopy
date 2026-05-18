@@ -41,7 +41,7 @@ scheduler:
   num_train_timesteps: 1000
   sigma_min: 0.002
   sigma_max: 80.0
-  sigma_data: 0.5
+  sigma_data: 0.4
   rho: 7.0
   prediction_type: "sample"
 
@@ -74,6 +74,6 @@ phases:
     batch_size: 16
     max_steps: -1
     datasets: ["sr_caco2", "fmd", "neuronal_cells", "rxrx1"]  # replace with your full foundation dataset list if needed
-    epochs_to_save: [50, 100, 150, 200]
+    epochs_to_save: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
     description: "UNet (EDM) unconditional prior on microscopy foundation dataset"
 

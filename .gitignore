@@ -14,3 +14,25 @@ phase_state.json
 # Python cache
 **/__pycache__/
 **/*.pyc
+
+# Sweep configs and runners
+run_exp_sweep.py
+config/exp_recon_sweep.yaml
+EXP/
+EXP2/
+EXP_BPAE_FT/
+EXP_DD_v1/
+
+# Local / large / per-user
+.claude/
+CLAUDE.md
+BPAE/
+analysis/
+microscopy_runs_*/
+posterior_samples_RL/
+test_mix/
+
+# Per-user / experiment-specific configs
+config/microscopy_mini.yaml
+config/BPAE_unet_ft.yaml
+config/posterior_sampling_BPAE_RL.yaml

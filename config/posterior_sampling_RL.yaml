@@ -1,0 +1,61 @@
+# Posterior Sampling with Poisson Noise (Richardson-Lucy)
+# ======================================================
+# Configuration for DAPS + RL deconvolution on microscopy images
+
+model:
+  checkpoint_path: "./microscopy_runs_unet_foundation/checkpoints/last.ckpt"
+
+data:
+  test_dir: "./test_mix"
+  image_size: [512, 512]
+  num_samples: 200
+  random_select: true
+  images_are_clean: true
+
+output:
+  save_dir: "./posterior_samples_RL2"
+  save_intermediate: false
+  save_comparison: true
+  add_labels: false
+
+# DAPS Algorithm Parameters
+# Two-stage data consistency (DiffRL-style), no pure-ODE phase:
+#   Stage 1 (sigma >= 1/sqrt(poisson_scale) = 1/SNR): Richardson-Lucy MCMC
+#   Stage 2 (sigma <  1/SNR): Gaussian MCMC vs. synthetic measurement K(prev_state)
+# The switch happens automatically inside utils/mcmc_sampler.py::sample_RL.
+daps:
+  annealing_steps: 100
+  sigma_max: 100.0
+  sigma_min: 0.1
+  rho: 7.0
+  mcmc_steps: 10        # Gaussian-MCMC steps used in Stage 2
+  mcmc_lr: 0.003        # Gaussian-MCMC step size used in Stage 2
+  mc_algo: "langevin"
+  tau: 0.01
+  prior_solver: "gaussian"
+  sigma_bar: 1        # below this, estimate x0hat with multi-step Euler instead of single-step Tweedie
+  num_ode_steps: 20     # number of Euler mini-steps used when sigma < sigma_bar
+
+# Forward Operator (blur only, no Gaussian noise)
+operator:
+  type: "gaussian_blur"
+  kernel_size: 31
+  intensity: 3.0
+
+# Poisson Noise Configuration
+poisson:
+  noise_type: "poisson"
+  scales: [1, 5, 10, 20, 100]   # Poisson scale values to sweep
+  # RL update parameters
+  rl_steps: 8             # Number of RL multiplicative updates per iteration
+  rl_alpha: 0.5                 # Damping factor in (0, 1]
+  rl_lam_reg: 0.001              # Regularization strength
+  rl_eps: 1.0e-8                 # Numerical stability constant
+
+device:
+  device: "cuda"
+  gpu_id: 0
+
+advanced:
+  seed: 42
+  verbose: true

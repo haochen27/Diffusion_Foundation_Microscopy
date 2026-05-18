@@ -115,17 +115,22 @@ class DiffusionPFODE:
 
 
 class DAPS:
-    """Decoupled Annealing Posterior Sampling (Hybrid DAPS + ODE)
+    """Decoupled Annealing Posterior Sampling (DiffRL-style two-stage).
 
-    Phase 1 (sigma >= ode_switch_sigma): Standard DAPS with fresh noise
-    Phase 2 (sigma <  ode_switch_sigma): Probability-flow ODE (no fresh noise)
-    RL/MCMC data consistency runs at every step in both phases.
+    Single annealed DAPS loop with fresh-noise re-injection at every step.
+    The two stages are implicit in the MCMC data-consistency step:
+      Stage 1 (sigma >= 1/sqrt(poisson_scale) = 1/SNR):
+          Richardson-Lucy update against the Poisson measurement.
+      Stage 2 (sigma <  1/SNR):
+          Gaussian MCMC against a synthetic clean measurement
+          K(prev_state), i.e. the operator applied to the most-recent x0hat.
+    Both stages are handled inside mcmc_sampler.sample_RL; no pure-ODE
+    phase is used. Matches ../DiffRL/sampler.py:DAPS behaviour.
     """
 
     def __init__(self, annealing_steps=20, mcmc_steps=10, mcmc_lr=0.1,
                  tau=0.01, sigma_max=10.0, sigma_min=0.002,
-                 solver='tweedie', num_ode_steps=1, sigma_bar=0.5, rho=-7.0,
-                 ode_phase_steps=50, ode_switch_sigma=0.0):
+                 solver='tweedie', num_ode_steps=1, sigma_bar=0.5, rho=-7.0, rl_steps=1):
         self.annealing_scheduler = EDMSchedulerForDAPS(
             num_steps=annealing_steps,
             sigma_max=sigma_max,
@@ -140,49 +145,23 @@ class DAPS:
         self.solver = solver
         self.num_ode_steps = num_ode_steps
         self.sigma_bar = sigma_bar
-        self.ode_phase_steps = ode_phase_steps
-        self.ode_switch_sigma = ode_switch_sigma
-
-        self.pfode_scheduler = EDMSchedulerForDAPS(
-            num_steps=num_ode_steps,
-            sigma_max=sigma_max,
-            sigma_min=0.002,
-            rho=rho
-        )
+        self.rl_steps = rl_steps
 
         print(f"[DAPS] Initialized with {annealing_steps} annealing steps")
         print(f"[DAPS] MCMC: {mcmc_steps} steps, lr={mcmc_lr}, tau={tau}")
-        print(f"[DAPS] ODE Solver: {solver}" + (f" with {num_ode_steps} steps" if solver != 'tweedie' else " (direct denoising)"))
-        print(f"[DAPS] Phase1: DAPS (fresh noise) for sigma >= {ode_switch_sigma}")
-        print(f"[DAPS] Phase2: ODE (no fresh noise) for sigma < {ode_switch_sigma}, {ode_phase_steps} steps")
+        print(f"[DAPS] x0hat: multi-step Euler ({num_ode_steps}) when sigma < sigma_bar={sigma_bar}, else Tweedie")
+        print(f"[DAPS] Two-stage data consistency: RL above 1/SNR, Gaussian MCMC below (handled in sample_RL)")
 
     def sample(self, model, x_start, operator, measurement, verbose=False, save_trajectory=False):
         xt = x_start
         x_prev = None
         trajectory = [] if save_trajectory else None
         use_poisson = getattr(operator, 'use_poisson', False)
-        use_hybrid = self.ode_switch_sigma > 0
 
-        if use_hybrid:
-            # === Phase 1: Standard DAPS with fresh noise (sigma >= ode_switch_sigma) ===
-            daps_steps = []
-            for step in range(self.annealing_scheduler.num_steps - 1):
-                if self.annealing_scheduler.sigma_steps[step].item() >= self.ode_switch_sigma:
-                    daps_steps.append(step)
-                else:
-                    break
-        else:
-            # All steps are DAPS (no ODE phase)
-            daps_steps = list(range(self.annealing_scheduler.num_steps - 1))
+        num_iters = self.annealing_scheduler.num_steps - 1
+        pbar = tqdm.trange(num_iters, desc="DAPS") if verbose else range(num_iters)
 
-        if verbose:
-            phase_label = "Phase1-DAPS" if use_hybrid else "DAPS"
-            print(f"[{phase_label}] {len(daps_steps)} steps")
-
-        pbar = tqdm.trange(len(daps_steps), desc="Phase1-DAPS" if use_hybrid else "DAPS") if verbose else range(len(daps_steps))
-
-        for i in pbar:
-            step = daps_steps[i]
+        for step in pbar:
             sigma = self.annealing_scheduler.sigma_steps[step]
             sigma_val = sigma.item()
 
@@ -201,15 +180,14 @@ class DAPS:
                         s_t = torch.tensor([sk], device=xt.device, dtype=torch.float32)
                         x0hat = model.tweedie(x_ode, s_t)
                         x_ode = x_ode + (x_ode - x0hat) * ((sk1 - sk) / sk)
-                    # x0hat is already set to the last Tweedie estimate
                 else:
                     x0hat = model.tweedie(xt, sigma)
 
-            ratio = step / (self.annealing_scheduler.num_steps - 1)
+            ratio = step / num_iters
             if use_poisson:
                 x0y = self.mcmc_sampler.sample_RL(
                     xt, model, x0hat, operator, measurement, sigma, ratio,
-                    verbose=False, prev_state=x_prev
+                    verbose=False, prev_state=x_prev, rl_steps=self.rl_steps
                 )
             else:
                 x0y = self.mcmc_sampler.sample(
@@ -225,78 +203,15 @@ class DAPS:
                     'xt': xt.detach().cpu()
                 })
 
-            # Fresh noise re-injection
-            if i < len(daps_steps) - 1:
-                sigma_next = self.annealing_scheduler.sigma_steps[daps_steps[i + 1]]
+            # Forward diffusion: re-noise to next annealing sigma (fresh noise every step)
+            if step < num_iters - 1:
+                sigma_next = self.annealing_scheduler.sigma_steps[step + 1]
                 xt = x0y + torch.randn_like(x0y) * sigma_next
-            elif use_hybrid:
-                # Handoff: re-noise to exactly ode_switch_sigma for Phase 2
-                xt = x0y + torch.randn_like(x0y) * self.ode_switch_sigma
             else:
                 xt = x0y
 
             if verbose and isinstance(pbar, tqdm.tqdm):
                 pbar.set_postfix({'sigma': f'{sigma_val:.4f}'})
-
-        # === Phase 2: Probability-flow ODE (only when hybrid mode is active) ===
-        if use_hybrid:
-            ode_sigmas = np.exp(np.linspace(
-                np.log(self.ode_switch_sigma),
-                np.log(max(self.annealing_scheduler.sigma_min, 0.002)),
-                self.ode_phase_steps
-            )).astype(np.float32)  # Ensure float32
-
-            if verbose:
-                print(f"[Phase2] {self.ode_phase_steps - 1} ODE steps "
-                      f"(sigma: {ode_sigmas[0]:.4f} -> {ode_sigmas[-1]:.4f})")
-
-            pbar2 = tqdm.trange(self.ode_phase_steps - 1, desc="Phase2-ODE") if verbose else \
-                    range(self.ode_phase_steps - 1)
-
-            n_daps = len(daps_steps)
-
-            for i in pbar2:
-                s_cur = float(ode_sigmas[i])
-                s_nxt = float(ode_sigmas[i + 1])
-
-                with torch.no_grad():
-                    s_tensor = torch.tensor([s_cur], device=xt.device, dtype=torch.float32)
-                    x0hat = model.tweedie(xt, s_tensor)
-
-                global_step = n_daps + i
-                total_steps = n_daps + self.ode_phase_steps - 1
-                ratio = global_step / total_steps
-
-                if use_poisson:
-                    x0y = self.mcmc_sampler.sample_RL(
-                        xt, model, x0hat, operator, measurement,
-                        torch.tensor([s_cur], device=xt.device, dtype=torch.float32), ratio,
-                        verbose=False, prev_state=x_prev
-                    )
-                else:
-                    x0y = self.mcmc_sampler.sample(
-                        xt, model, x0hat, operator, measurement,
-                        torch.tensor([s_cur], device=xt.device, dtype=torch.float32), ratio, verbose=False
-                    )
-                x_prev = x0hat.clone().detach()
-
-                if save_trajectory:
-                    trajectory.append({
-                        'step': global_step, 'sigma': s_cur,
-                        'x0hat': x0hat.detach().cpu(),
-                        'x0y': x0y.detach().cpu(),
-                        'xt': xt.detach().cpu()
-                    })
-
-                # Probability-flow ODE step (NO fresh noise)
-                if i < self.ode_phase_steps - 2:
-                    step_ratio = (s_nxt - s_cur) / s_cur
-                    xt = xt + (xt - x0y) * step_ratio
-                else:
-                    xt = x0y
-
-                if verbose and isinstance(pbar2, tqdm.tqdm):
-                    pbar2.set_postfix({'sigma': f'{s_cur:.4f}'})
 
         if save_trajectory:
             return xt, trajectory
