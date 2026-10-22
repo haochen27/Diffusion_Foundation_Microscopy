@@ -1,161 +1,128 @@
-[![Made with Python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white)](https://pytorch.org/)
-[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-blue)](https://huggingface.co/)
+# Diffusion-RL
 
-# Microscopy Diffusion
+**Richardson–Lucy deconvolution with a learned diffusion prior for photon-limited fluorescence microscopy.**
 
-This repository has two major parts:
+[![Python](https://img.shields.io/badge/Python-3-1f425f.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-1. **Microscopy Diffusion Prior** — unconditional diffusion training on microscopy data (DiT or UNet, EDM scheduler).
-2. **Diffusion-based Sampling** — posterior-sampling pipelines built on the trained prior, for inverse problems with Gaussian or Poisson noise.
+Code for *Improving Richardson–Lucy Deconvolution with Diffusion Priors for Fluorescence Microscopy* (H. Chen and S. S. Howard, manuscript under review).
 
-## Checkpoints
+Diffusion-RL keeps the Poisson physics of classical Richardson–Lucy (RL) and adds a prior learned from real fluorescence images:
 
-Pretrained UNet foundation checkpoint:
-[Download (Google Drive)](https://drive.google.com/file/d/1Ux3-oHpUS5s-h9q5gFtQpcC0e6cl2CvP/view?usp=sharing)
+1. **Prior.** An unconditional diffusion model (EDM, U-Net) trained on fluorescence micrographs proposes a clean image at each noise level. It never sees a PSF or a photon count, so one prior works across microscopes.
+2. **Data consistency.** A few RL updates correct that proposal against the measured photon counts and the known PSF.
 
-Place it under `microscopy_runs_unet_foundation/checkpoints/last.ckpt` (or update `model.checkpoint_path` in the relevant config).
+Alternating the two reduces RL's noise amplification and keeps weak structures (thin filaments, mitochondria) that TV regularization smooths away, with the largest gains at low photon counts.
+
+## What's in the repo
+
+| Script | What it does |
+|---|---|
+| `posterior_sample_RL.py` | **Diffusion-RL** reconstruction (Poisson noise) |
+| `baseline_deconvolution.py` | RL and TV-RL baselines (no diffusion prior) |
+| `train.py` | Train the diffusion prior |
+| `sample.py` | Draw unconditional samples from the prior |
+| `posterior_sample.py` | Variant for Gaussian noise (DAPS with Langevin data consistency) |
+
+Settings live in `config/`; core code is in `core/` (models, EDM scheduler, training) and `utils/` (operators, samplers, metrics).
 
 ## Setup
+
 ```bash
+git clone https://github.com/haochen27/Diffusion_Foundation_Microscopy.git
+cd Diffusion_Foundation_Microscopy
 pip install -r requirements.txt
-python test_setup.py
+python test_setup.py   # quick import check
 ```
 
----
+A CUDA GPU is recommended.
 
-# Part 1 — Microscopy Diffusion Prior
+## Download the checkpoint and data
 
-Unconditional diffusion training to learn the general microscopy image distribution.
+| | Link | Put it at |
+|---|---|---|
+| Pretrained prior (U-Net, ~150 MB) | [last.ckpt](https://drive.google.com/file/d/1Ux3-oHpUS5s-h9q5gFtQpcC0e6cl2CvP/view?usp=sharing) | `microscopy_runs_unet_foundation/checkpoints/last.ckpt` |
+| Training data (processed SR-Caco-2, FMD, Neuronal Cells, RxRx1) | [Google Drive folder](https://drive.google.com/drive/folders/15z9U74yZGnWw90BSO-gA8xNEzRV-VG2B?usp=drive_link) | `../processed/foundation` |
 
-## Features
-- **DiT and UNet Backbones** at 512×512
-- **EDM Scheduler** (Karras et al.)
-- **Lightning DDP**, mixed precision (bf16 / fp16)
-- **EMA** (decay 0.9995, starts at step 2000)
-- **Epoch-based checkpointing** with full resume
-- **Real-time monitoring**: live loss plots, sample generation, GPU metrics
+You only need the checkpoint to run reconstructions. The training data is needed only to retrain the prior. Other locations work if you update `model.checkpoint_path` or `data.foundation_path` in the config.
 
-## Training
+## Quick start
+
+**1. Reconstruct with Diffusion-RL.** Put clean test images (`.png`) in a folder and set `data.test_dir` in `config/posterior_sampling_RL.yaml` to that folder. The script blurs each image with the configured PSF, draws Poisson counts, and reconstructs.
 
 ```bash
-# UNet foundation (current default)
+python posterior_sample_RL.py
+
+# a single photon budget instead of the sweep in the config
+python posterior_sample_RL.py --poisson_scale 10
+```
+
+Each output is a `measurement | reconstruction | ground truth` panel, saved to `output.save_dir`.
+
+**2. Run the baselines.** They read the same config (PSF, photon budgets, test folder):
+
+```bash
+python baseline_deconvolution.py --mode rl                   # TV-RL
+python baseline_deconvolution.py --mode rl --tv_weight 0     # plain RL
+```
+
+**3. Train the prior** (optional):
+
+```bash
 python train.py --config config/microscopy_unet.yaml
-
-# DiT foundation
-python train.py --config config/microscopy.yaml
-
-# Resume
-python train.py --config config/microscopy_unet.yaml --resume
+python train.py --config config/microscopy_unet.yaml --resume   # continue a run
 ```
 
-### Unconditional Foundation
-- **Objective**: Learn the general microscopy image distribution
-- **Data**: 46K+ foundation samples (SR-Caco2 + FMD)
-- **Architecture**: DiT-XL/8 or UNet (no conditioning)
-- **Epochs**: 50 (configurable)
-
-## Unconditional Sampling
+**4. Sample from the prior** (optional):
 
 ```bash
-# Basic
-python sample.py --config config/sampling.yaml
-
-# Custom parameters
-python sample.py --config config/sampling.yaml --num_samples 8 --method edm_euler --steps 100
+python sample.py --config config/sampling.yaml \
+  --checkpoint microscopy_runs_unet_foundation/checkpoints/last.ckpt --num_samples 8
 ```
 
-### Methods
-- **DDPM** — standard denoising diffusion probabilistic models
-- **DDIM** — denoising diffusion implicit models (faster, deterministic)
-- **EDM Euler** — Karras et al. EDM solver
+## Main settings
 
-## Data Format
+In `config/posterior_sampling_RL.yaml`:
 
-Expects preprocessed data with manifest structure:
+| Key | Meaning |
+|---|---|
+| `operator.kernel_size`, `operator.intensity` | Gaussian PSF support and width (px) |
+| `poisson.scales` | Photon budgets to test (mean-count scale α) |
+| `poisson.rl_steps` | RL updates per diffusion step |
+| `poisson.rl_alpha` | Damping of each RL update, in (0, 1] |
+| `daps.annealing_steps` | Number of diffusion (noise-level) steps |
+
+At high noise levels the data-consistency step uses RL against the Poisson counts. At low noise levels, below 1/√(Poisson scale), it switches to Gaussian MCMC (`utils/mcmc_sampler.py::sample_RL`).
+
+## Data format
+
+Training data follows this layout (the Drive folder above already matches it):
+
 ```
-<root>/
-├── dataset_name/
-│   ├── images/          # PNG, 16-bit, or .npz files
-│   └── manifests/
-│       └── manifest.csv # Columns: id, image, dataset, channel_idx, norm_lo, norm_hi, ...
-```
-Images are normalized to `[-1, 1]` for training. Configs reference data via `data.foundation_path` and `data.degraded_path`.
-
-Dataset download: [Microscopy Dataset (Google Drive)](https://drive.google.com/drive/folders/1t-8SP_YxnNr99ELzuNWtRAws_CNlwPK0?usp=sharing)
-
----
-
-# Part 2 — Diffusion-based Sampling
-
-Posterior-sampling pipelines built on the trained unconditional prior for inverse problems (deblurring, denoising, super-resolution). Both use Decoupled Annealing Posterior Sampling (DAPS) with annealed Langevin MCMC data consistency.
-
-## Gaussian Noise — `posterior_sample.py`
-
-Standard DAPS with Gaussian-likelihood data consistency. Suitable when the measurement noise is approximately Gaussian.
-
-```bash
-python posterior_sample.py --config config/posterior_sampling.yaml
+<foundation_path>/
+└── <dataset_name>/
+    ├── images/                # PNG, 16-bit, or .npz
+    └── manifests/manifest.csv # id, image, dataset, channel_idx, norm_lo, norm_hi, ...
 ```
 
-Config: `config/posterior_sampling.yaml`
-- Forward operator: Gaussian blur, downsample, additive Gaussian noise
-- MCMC: Langevin updates against a Gaussian likelihood
-- Solver: Tweedie or multi-step Euler for `x0hat`
-
-## Poisson Noise (Richardson–Lucy) — `posterior_sample_RL.py`
-
-DAPS with two-stage data consistency tailored to photon-counting (Poisson) noise. The transition is governed by the noise SNR and is handled automatically inside `utils/mcmc_sampler.py::sample_RL`:
-
-- **Stage 1** (`sigma >= 1/sqrt(poisson_scale) = 1/SNR`): Richardson–Lucy multiplicative updates against the Poisson measurement.
-- **Stage 2** (`sigma <  1/SNR`): Gaussian MCMC against a synthetic clean measurement `K(prev_state)`, i.e. the forward operator applied to the most recent `x0hat`.
-
-```bash
-python posterior_sample_RL.py --config config/posterior_sampling_RL.yaml
-```
-
-Config: `config/posterior_sampling_RL.yaml`
-- Forward operator: Gaussian blur (no additive Gaussian noise)
-- Poisson `scales` sweep (e.g. `[1, 5, 10, 20, 100]`)
-- RL parameters: `rl_steps`, `rl_alpha` (damping), `rl_lam_reg`, `rl_eps`
-
-## Common
-
-Both pipelines reuse the same prior checkpoint (`model.checkpoint_path`) and write side-by-side comparisons of `measurement / reconstruction / ground truth` to `output.save_dir`.
-
----
+Images are normalized to `[-1, 1]` for training.
 
 ## Citation
 
-### DiT
+If you use this code, please cite:
 
 ```bibtex
-@article{peebles2023scalable,
-  title={Scalable Diffusion Models with Transformers},
-  author={Peebles, William and Xie, Saining},
-  journal={arXiv preprint arXiv:2212.09748},
-  year={2023}
+@misc{chen2026diffusionrl,
+  title  = {Improving {Richardson--Lucy} Deconvolution with Diffusion Priors for Fluorescence Microscopy},
+  author = {Chen, Hao and Howard, Scott S.},
+  year   = {2026},
+  note   = {Manuscript under review}
 }
 ```
 
-### EDM
+This work builds on [EDM](https://github.com/NVlabs/edm) (Karras et al., NeurIPS 2022) and [DAPS](https://github.com/zhangbingliang2019/DAPS) (Zhang et al., CVPR 2025); please cite them as well. The optional DiT backbone follows [Peebles & Xie](https://github.com/facebookresearch/DiT) (ICCV 2023).
 
-```bibtex
-@inproceedings{karras2022elucidating,
-  title={Elucidating the Design Space of Diffusion-Based Generative Models},
-  author={Karras, Tero and Aittala, Miika and Aila, Timo and Laine, Samuli},
-  booktitle={Advances in Neural Information Processing Systems},
-  year={2022}
-}
-```
+## License
 
-### DAPS
-
-```bibtex
-@article{zhang2024improving,
-  title={Improving Diffusion Inverse Problem Solving with Decoupled Noise Annealing},
-  author={Zhang, Bingliang and Chu, Wenda and Berner, Julius and Meng, Chenlin and Anandkumar, Anima and Song, Yang},
-  journal={arXiv preprint arXiv:2407.01521},
-  year={2024}
-}
-```
+[MIT](LICENSE)
